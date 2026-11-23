@@ -4,14 +4,28 @@
 //! order: slot `i` is made from what the title wrote at slot `i`, when it
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
+//!
+//! On a host whose view heaps are smaller than the title's (NVIDIA caps
+//! them at 1,000,000), the order holds within pages of the title heap:
+//! [`PageMap`] gives a page a host page when a view is first written in it.
 
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Foundation::E_INVALIDARG;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use super::pages::{Exhausted, PageMap};
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+
+/// Logs `what` the first time it happens.
+macro_rules! once {
+    ($($arg:tt)*) => {{
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!($($arg)*));
+    }};
+}
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -19,6 +33,8 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have [`DYNAMIC`] more.
     count: u32,
+    /// Where title descriptors lie in the first `count` slots.
+    pages: Mutex<PageMap>,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
@@ -38,6 +54,12 @@ const DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+        Self::with_limit(sampler, count, u32::MAX)
+    }
+
+    /// [`HostHeap::new`] on a host whose view heaps hold at most `limit`
+    /// descriptors (tests; the host's own limit applies as well).
+    fn with_limit(sampler: bool, count: u32, limit: u32) -> Option<Self> {
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -57,13 +79,22 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count) = match make(count + extra) {
-            Ok(heap) => (heap, count),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out;
-                // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra)
+        let whole = if count + extra <= limit {
+            make(count + extra)
+        } else {
+            Err(E_INVALIDARG.into())
+        };
+        let (heap, pages) = match whole {
+            Ok(heap) => (heap, PageMap::new(count, count)),
+            Err(e) if !sampler && count + extra > PORTABLE_VIEWS.min(limit) => {
+                let pages = PageMap::new(count, PORTABLE_VIEWS.min(limit) - extra);
+                tracing::warn!(
+                    error = %e,
+                    count,
+                    slots = pages.slots(),
+                    "host view heap capped: title descriptors go to host pages as written"
+                );
+                (make(pages.slots() + extra).ok()?, pages)
             }
             Err(e) => {
                 tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -77,12 +108,14 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
+        let count = pages.slots();
         tracing::debug!(count, sampler, "host descriptor heap");
         let h = HostHeap {
             heap,
             cpu,
             step,
             count,
+            pages: Mutex::new(pages),
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -250,20 +283,51 @@ impl HostHeap {
         }
     }
 
-    /// Makes host slot `index` from the record the title has at `handle`
-    /// if it changed since, and returns the view recorded there. Buffer
-    /// views are made only for draws (`for_draw`), which also copy their
-    /// data: a host copy of a buffer is made on first use.
-    pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
-        if index >= self.count {
-            return None;
+    /// The host slot of title descriptor `index`, its page given a host
+    /// page if it has none; none when no host page is left (logged).
+    pub(crate) fn slot(&self, index: u32) -> Option<u32> {
+        let mapped = self.pages.lock().unwrap_or_else(|e| e.into_inner()).map(index);
+        match mapped {
+            Ok(slot) => Some(slot),
+            Err(Exhausted) => {
+                once!(
+                    index,
+                    slots = self.count,
+                    "no host descriptor page left: views in this part of the title heap are not made"
+                );
+                None
+            }
         }
+    }
+
+    /// Whether the `n` title descriptors from `index` lie in a run of host
+    /// slots, as a table read from its first slot needs.
+    pub(crate) fn run(&self, index: u32, n: u32) -> bool {
+        self.pages.lock().unwrap_or_else(|e| e.into_inner()).run(index, n)
+    }
+
+    /// Makes the host slot of title descriptor `index` from the record the
+    /// title has at `handle` if it changed since, and returns the view
+    /// recorded there. Buffer views are made only for draws (`for_draw`),
+    /// which also copy their data: a host copy of a buffer is made on first
+    /// use.
+    pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        // A page gets a host page for a view; a page without one holds only
+        // null slots, which need nothing.
+        let index = match view {
+            Some(_) => self.slot(index)?,
+            None => self
+                .pages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .find(index)?,
+        };
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
@@ -302,13 +366,6 @@ impl HostHeap {
     }
 }
 
-/// Logs `what` the first time it happens.
-macro_rules! once {
-    ($($arg:tt)*) => {{
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!($($arg)*));
-    }};
-}
 
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -727,5 +784,28 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+    }
+
+    /// Grand Theft Auto VI's main view heap on a host that caps view heaps
+    /// at 1,000,000 (NVIDIA): the host heap stays under the cap, and the
+    /// title's last descriptors get slots inside it, below the dynamic ones.
+    #[test]
+    fn a_capped_view_heap_holds_the_titles_high_descriptors() {
+        const TITLE: u32 = 1_245_184;
+        let Some(heap) = HostHeap::with_limit(false, TITLE, PORTABLE_VIEWS) else {
+            return; // no host GPU
+        };
+        // SAFETY: a plain query of a live heap.
+        let made = unsafe { heap.heap.GetDesc() }.NumDescriptors;
+        assert!(made <= PORTABLE_VIEWS, "{made}");
+        assert_eq!(made, heap.count + DYNAMIC);
+        for index in [TITLE - 2 * 4096, TITLE - 1, PORTABLE_VIEWS, 1 << 20] {
+            let slot = heap.slot(index).unwrap();
+            assert!(slot < heap.count, "{index} -> {slot}");
+        }
+        // The last two title pages, written in order, are one run of slots.
+        assert!(heap.run(TITLE - 4096 - 2, 4));
+        let dynamic = heap.dynamic(1).unwrap();
+        assert!((heap.count..made).contains(&dynamic));
     }
 }

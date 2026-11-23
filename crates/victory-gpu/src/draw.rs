@@ -285,7 +285,9 @@ impl State {
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
         match (self.roots_ref(compute).get(usize::from(slot)), root) {
             (Some(Root::Table(handle)), RootType::Table) => match self.heap_of(*handle) {
-                Some(heap) => (handle - heap.start) as u32,
+                Some(heap) => heap
+                    .host_offset(*handle)
+                    .unwrap_or((handle - heap.start) as u32),
                 None => {
                     once!(
                         handle = format_args!("{handle:#x}"),
@@ -606,6 +608,32 @@ impl State {
                 self.table_entry(list, u, compute);
             }
         }
+        // A table across title pages whose host pages are apart (a host
+        // heap smaller than the title's) is made afresh too.
+        let mut apart: Vec<u8> = used
+            .iter()
+            .filter(tables)
+            .map(|u| u.slot)
+            .filter(|slot| !fresh.contains(slot))
+            .collect();
+        apart.sort_unstable();
+        apart.dedup();
+        apart.retain(|&slot| {
+            let n = used
+                .iter()
+                .filter(tables)
+                .filter(|u| u.slot == slot)
+                .map(|u| u.table_offset_dwords / 8 + 1)
+                .max()
+                .unwrap_or(1);
+            match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::Table(table)) => self
+                    .heap_of(table)
+                    .is_some_and(|heap| !heap.host_run(table, n)),
+                _ => false,
+            }
+        });
+        fresh.extend(apart);
         let mut made = Vec::new();
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {

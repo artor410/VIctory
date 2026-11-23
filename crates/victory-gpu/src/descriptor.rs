@@ -12,6 +12,7 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+mod pages;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -94,6 +95,27 @@ impl Heap {
             h.mirror(i, self.start + u64::from(i) * step, false);
         }
         Some(h)
+    }
+
+    /// Where a table at `handle` starts in the host heap, in bytes from
+    /// its start as shaders read it: the host slot of its first descriptor
+    /// (the title's index unless the host heap is smaller than the title's).
+    #[cfg(windows)]
+    pub(crate) fn host_offset(&self, handle: u64) -> Option<u32> {
+        let step = increment(self.desc.kind)?;
+        let index = self.index(handle)?;
+        let within = (handle - self.start) as u32 % step;
+        Some(self.host()?.slot(index)? * step + within)
+    }
+
+    /// Whether a table of `n` descriptors at `handle` is a run of host
+    /// slots, so that shaders can read it from its first.
+    #[cfg(windows)]
+    pub(crate) fn host_run(&self, handle: u64, n: u32) -> bool {
+        match (self.host(), self.index(handle)) {
+            (Some(host), Some(index)) => host.run(index, n),
+            _ => true,
+        }
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
